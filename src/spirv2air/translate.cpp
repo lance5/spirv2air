@@ -105,7 +105,8 @@ struct SType {
   uint32_t storage = 0;    // Pointer: storage class
   spv::Dim dim = spv::DimMax;  // Image
   bool arrayed = false;
-  bool multisampled = false;      // Image (compute)
+  bool multisampled = false;      // Image (direct-binding / SubpassData)
+  bool storageImage = false;      // Image (OpTypeImage Sampled == 2, OpImageWrite)
   bool isSigned = false;          // Int
   std::vector<uint32_t> members;  // Struct
   Type* llvm = nullptr;    // value type; null for types without one (pointers, images, runtime arrays)
@@ -138,7 +139,7 @@ struct Pointer {
   Value* fcIndex = nullptr;
 };
 
-enum class AttrClass { Pure, Bits, Texture, TextureRead, Derivative, Discard, Atomic, Barrier };
+enum class AttrClass { Pure, Bits, Texture, TextureRead, TextureWrite, Derivative, Discard, Atomic, Barrier };
 
 class Translator {
  public:
@@ -168,6 +169,7 @@ class Translator {
   // ---- signature, entry and exit
   void buildSignature();
   void buildComputeSignature();
+  void addDirectResourceArg(uint32_t var);
   void addSampleInputs(uint32_t sampleId, uint32_t sampleMaskIn);
   void buildEntry();
   void buildComputeEntry();
@@ -226,6 +228,7 @@ class Translator {
   Value* packNormalized(const char* name, Value* x);
   Value* sample(const Inst& in);
   Value* fetch(const Inst& in);
+  void imageWrite(const Inst& in);
   Value* atomic(const Inst& in);
   Value* atomicExtra(const Inst& in);
   Value* imageQuery(const Inst& in);
@@ -256,7 +259,7 @@ class Translator {
   Value* demoted_ = nullptr;  // private i1 set by OpDemoteToHelperInvocation, created on first use
   Type *i1_, *i8_, *i16_, *i32_, *i64_, *f16_, *f32_, *v4f32_;
   Type *tlabTy_, *resHeapTy_, *smpHeapTy_, *samplerTy_;
-  Type *tex2d_ = nullptr, *tex2dMs_ = nullptr;  // compute textures
+  Type *tex2d_ = nullptr, *tex2dMs_ = nullptr, *tex2dArray_ = nullptr;  // direct-binding textures
   std::map<int, Type*> textureTypes_;           // by spv::Dim, plus kArrayedKey for an arrayed image
   static constexpr int kArrayedKey = 0x100;
   Value* arrayLayer(Value* coordinate);
@@ -276,7 +279,7 @@ class Translator {
   std::vector<std::pair<Instruction*, Inst>> phis_;
   std::unordered_map<std::string, Function*> decls_;
   std::vector<std::pair<const char*, Function*>> fastDecls_;  // fast()'s callee per op literal
-  const AttrList* classAttrs_[8] = {};  // declare()'s attribute list per AttrClass, built on first use
+  const AttrList* classAttrs_[9] = {};  // declare()'s attribute list per AttrClass, built on first use
   std::map<uint32_t, std::pair<Value*, Value*>> sampledImages_;  // id -> (texture, sampler)
   std::map<uint32_t, uint32_t> sampledImageType_;                 // id -> SPIR-V image type
   std::map<uint32_t, uint32_t> attachmentArgs_;  // input attachment variable -> AIR argument
@@ -294,6 +297,9 @@ class Translator {
   uint32_t tessCoord_ = kNone, controlPointInput_ = kNone;
   bool tese() const { return patchDomain_ != PatchDomain::None; }
   bool compute() const { return model_ == spv::ExecutionModelGLCompute; }
+  bool directBindings() const {
+    return compute() || (model_ == spv::ExecutionModelFragment && options_.directBindings);
+  }
   uint32_t localSize_[3] = {1, 1, 1};
   uint32_t glslExt_ = kNone;
   uint32_t spirv2airExt_ = kNone;  // NonSemantic.spirv2air (KeepBranch)
@@ -362,7 +368,9 @@ const SType& Translator::type(uint32_t id) const {
 std::string Translator::varyingTypeName(uint32_t id) const {
   const SType& st = type(id);
   const SType& scalar = st.op == spv::OpTypeVector ? type(st.elem) : st;
-  std::string base = scalar.op == spv::OpTypeFloat ? "float" : scalar.isSigned ? "int" : "uint";
+  std::string base = scalar.op == spv::OpTypeFloat ? (scalar.count == 16 ? "half" : "float")
+                     : scalar.isSigned             ? "int"
+                                                   : "uint";
   return st.op == spv::OpTypeVector ? base + std::to_string(st.count) : base;
 }
 
@@ -373,7 +381,8 @@ Type* Translator::llvmType(uint32_t id) const {
 }
 
 bool isFloatVector(const Type* t) {
-  return t->kind == Type::Float || (t->kind == Type::Vector && t->elem->kind == Type::Float);
+  auto isF = [](const Type* e) { return e->kind == Type::Float || e->kind == Type::Half; };
+  return isF(t) || (t->kind == Type::Vector && isF(t->elem));
 }
 
 bool isIntVector(const Type* t) {
@@ -451,7 +460,8 @@ void Translator::decode() {
             c != spv::CapabilityCullDistance && c != spv::CapabilityFloatControls2 &&
             c != spv::CapabilityFragmentBarycentricKHR && c != spv::CapabilityFragmentShaderPixelInterlockEXT &&
             c != spv::CapabilityInterpolationFunction && c != spv::CapabilityGroupNonUniform &&
-            c != spv::CapabilityGroupNonUniformVote)
+            c != spv::CapabilityGroupNonUniformVote && c != spv::CapabilityStencilExportEXT &&
+            c != spv::CapabilityFloat16 && c != spv::CapabilityStorageInputOutput16)
           fail("capability " + std::to_string(c));
         if (c == spv::CapabilityFragmentShaderPixelInterlockEXT && options_.graphics.rasterOrderedBuffer < 0)
           fail("pixel interlock requires graphics.rasterOrderedBuffer");
@@ -492,6 +502,7 @@ void Translator::decode() {
           case spv::ExecutionModeVertexOrderCcw:
           case spv::ExecutionModeOriginUpperLeft:
           case spv::ExecutionModeDepthReplacing:
+          case spv::ExecutionModeStencilRefReplacingEXT:
           // Raster order groups order every access to the raster-ordered buffer, see OpBeginInvocationInterlockEXT.
           case spv::ExecutionModePixelInterlockOrderedEXT:
             break;
@@ -651,8 +662,9 @@ void Translator::declareType(const Inst& in) {
       break;
     case spv::OpTypeFloat:
       t.count = in.operand(1);
-      if (t.count != 32) fail("float width " + std::to_string(t.count));
-      t.llvm = f32_;
+      if (t.count == 16) t.llvm = f16_;
+      else if (t.count == 32) t.llvm = f32_;
+      else fail("float width " + std::to_string(t.count));
       break;
     case spv::OpTypeVector:
       t.elem = in.operand(1);
@@ -686,10 +698,18 @@ void Translator::declareType(const Inst& in) {
       t.elem = in.operand(1);
       t.dim = spv::Dim(in.operand(2));
       t.arrayed = in.operand(4) != 0;
-      if (compute()) {
-        // Sampled 2D images, fetched with OpImageFetch.
+      if (directBindings()) {
+        // Sampled 2D images (fetched with OpImageFetch) and 2D/2DArray storage images (written with OpImageWrite).
         t.multisampled = in.operand(5) != 0;
-        if (t.dim != spv::Dim2D || t.arrayed || in.operand(6) != 1) fail("compute image other than a sampled 2D one");
+        uint32_t sampled = in.operand(6);
+        if (sampled == 1) {
+          if (t.dim != spv::Dim2D || t.arrayed) fail("direct-binding sampled image other than 2D");
+        } else if (sampled == 2) {
+          if (t.dim != spv::Dim2D || t.multisampled) fail("storage image other than non-multisampled 2D/2DArray");
+          t.storageImage = true;
+        } else {
+          fail("direct-binding image sampled=" + std::to_string(sampled));
+        }
         if (type(t.elem).op != spv::OpTypeFloat && type(t.elem).op != spv::OpTypeInt) fail("image sampled type");
         break;
       }
@@ -752,9 +772,10 @@ void Translator::buildSignature() {
 
   // Classify the module-scope variables.
   std::map<uint32_t, uint32_t> inputs, outputs;  // location -> variable
+  std::vector<uint32_t> directResources;
   uint32_t vertexIndex = kNone, primitiveId = kNone, fragCoord = kNone, frontFacing = kNone, perVertex = kNone,
-           fragDepth = kNone, sampleMask = kNone, sampleMaskIn = kNone, sampleId = kNone, zpdCounter = kNone,
-           linearBarycentric = kNone, rasterOrdered = kNone;
+           fragDepth = kNone, fragStencil = kNone, sampleMask = kNone, sampleMaskIn = kNone, sampleId = kNone,
+           zpdCounter = kNone, linearBarycentric = kNone, rasterOrdered = kNone;
   for (uint32_t var : globals_) {
     const SType& pt = type(varType_[var]);
     const Decorations& d = decor_[var];
@@ -783,11 +804,16 @@ void Translator::buildSignature() {
       case spv::StorageClassOutput:
         if (vertex && type(pt.elem).op == spv::OpTypeStruct) perVertex = var;
         else if (!vertex && d.builtin == spv::BuiltInFragDepth) fragDepth = var;
+        else if (!vertex && d.builtin == spv::BuiltInFragStencilRefEXT) fragStencil = var;
         else if (!vertex && d.builtin == spv::BuiltInSampleMask) sampleMask = var;
         else if (d.builtin == kNone && d.location != kNone) outputs[d.location] = var;
         else fail("output " + what);
         break;
       case spv::StorageClassUniform:
+        if (directBindings()) {
+          directResources.push_back(var);
+          break;
+        }
         if (isFunctionConstant(var)) {
           const SType& block = type(pt.elem);
           if (block.op != spv::OpTypeStruct || block.members.size() != 1 ||
@@ -799,6 +825,10 @@ void Translator::buildSignature() {
         if (d.set != options_.graphics.constantsSet || d.binding >= options_.graphics.constantBufferCount) fail("uniform " + what);
         break;
       case spv::StorageClassStorageBuffer:
+        if (directBindings()) {
+          directResources.push_back(var);
+          break;
+        }
         if (!vertex && options_.graphics.occlusionCounterBuffer >= 0 &&
             d.set == options_.graphics.occlusionCounterSet && d.binding == options_.graphics.occlusionCounterBinding &&
             zpdCounter == kNone)
@@ -811,7 +841,15 @@ void Translator::buildSignature() {
         } else if (d.set != options_.graphics.sharedMemorySet || d.binding != options_.graphics.sharedMemoryBinding)
           fail("storage buffer " + what);
         break;
+      case spv::StorageClassPushConstant:
+        if (!directBindings()) fail("push constants require direct bindings");
+        directResources.push_back(var);
+        break;
       case spv::StorageClassUniformConstant: {
+        if (directBindings()) {
+          directResources.push_back(var);
+          break;
+        }
         if (type(pt.elem).op == spv::OpTypeImage && type(pt.elem).dim == spv::DimSubpassData) {
           if (d.attachment >= 8 || !(options_.graphics.framebufferFetchMask & (1u << d.attachment)))
             fail("input attachment requires explicit framebufferFetchMask mapping");
@@ -827,6 +865,8 @@ void Translator::buildSignature() {
         else fail("resource " + what);
         break;
       }
+      case spv::StorageClassPrivate:
+        break;
       default: fail("storage class " + std::to_string(pt.storage) + " of " + what);
     }
   }
@@ -924,29 +964,33 @@ void Translator::buildSignature() {
         S("air.raster_order_group"), I(0), S("air.arg_type_name"), S("float4"),
         S("air.arg_name"), S("previous" + std::to_string(d.attachment))});
   }
-  auto indirect = [&](int location, const char* typeName) -> std::vector<Metadata*> {
-    return {S("air.indirect_buffer"), S("air.location_index"), I(location), I(1), S("air.read"),
-            S("air.address_space"), I(2), S("air.struct_type_info"), m_.mdNode({}), S("air.arg_type_name"),
-            S(typeName), S("air.arg_name"), S(typeName)};
-  };
-  argTlab_ = int(addArg(m_.ptrTy(tlabTy_, 2), indirect(options_.graphics.argumentBuffer, "struct.ArgumentBuffer")));
-  if (usesTextures_)
-    argResHeap_ =
-        int(addArg(m_.ptrTy(resHeapTy_, 2), indirect(options_.graphics.resourceHeapBuffer, "struct.ResourceHeap")));
-  if (usesSamplers_)
-    argSmpHeap_ =
-        int(addArg(m_.ptrTy(smpHeapTy_, 2), indirect(options_.graphics.samplerHeapBuffer, "struct.SamplerHeap")));
-  if (zpdCounter != kNone)
-    argOfInput_[zpdCounter] = int(addArg(
-        m_.ptrTy(i8_, 1), {S("air.buffer"), S("air.location_index"), I(options_.graphics.occlusionCounterBuffer), I(1), S("air.read_write"),
-                           S("air.address_space"), I(1), S("air.arg_type_size"), I(1), S("air.arg_type_align_size"),
-                           I(1), S("air.arg_type_name"), S("uchar"), S("air.arg_name"), S("zpd_counter")}));
-  if (rasterOrdered != kNone)
-    argOfInput_[rasterOrdered] = int(addArg(
-        m_.ptrTy(i8_, 1), {S("air.buffer"), S("air.location_index"), I(options_.graphics.rasterOrderedBuffer), I(1),
-                           S("air.read_write"), S("air.address_space"), I(1), S("air.raster_order_group"), I(0),
-                           S("air.arg_type_size"), I(1), S("air.arg_type_align_size"), I(1), S("air.arg_type_name"),
-                           S("uchar"), S("air.arg_name"), S("raster_ordered")}));
+  if (directBindings()) {
+    for (uint32_t var : directResources) addDirectResourceArg(var);
+  } else {
+    auto indirect = [&](int location, const char* typeName) -> std::vector<Metadata*> {
+      return {S("air.indirect_buffer"), S("air.location_index"), I(location), I(1), S("air.read"),
+              S("air.address_space"), I(2), S("air.struct_type_info"), m_.mdNode({}), S("air.arg_type_name"),
+              S(typeName), S("air.arg_name"), S(typeName)};
+    };
+    argTlab_ = int(addArg(m_.ptrTy(tlabTy_, 2), indirect(options_.graphics.argumentBuffer, "struct.ArgumentBuffer")));
+    if (usesTextures_)
+      argResHeap_ =
+          int(addArg(m_.ptrTy(resHeapTy_, 2), indirect(options_.graphics.resourceHeapBuffer, "struct.ResourceHeap")));
+    if (usesSamplers_)
+      argSmpHeap_ =
+          int(addArg(m_.ptrTy(smpHeapTy_, 2), indirect(options_.graphics.samplerHeapBuffer, "struct.SamplerHeap")));
+    if (zpdCounter != kNone)
+      argOfInput_[zpdCounter] = int(addArg(
+          m_.ptrTy(i8_, 1), {S("air.buffer"), S("air.location_index"), I(options_.graphics.occlusionCounterBuffer), I(1), S("air.read_write"),
+                             S("air.address_space"), I(1), S("air.arg_type_size"), I(1), S("air.arg_type_align_size"),
+                             I(1), S("air.arg_type_name"), S("uchar"), S("air.arg_name"), S("zpd_counter")}));
+    if (rasterOrdered != kNone)
+      argOfInput_[rasterOrdered] = int(addArg(
+          m_.ptrTy(i8_, 1), {S("air.buffer"), S("air.location_index"), I(options_.graphics.rasterOrderedBuffer), I(1),
+                             S("air.read_write"), S("air.address_space"), I(1), S("air.raster_order_group"), I(0),
+                             S("air.arg_type_size"), I(1), S("air.arg_type_align_size"), I(1), S("air.arg_type_name"),
+                             S("uchar"), S("air.arg_name"), S("raster_ordered")}));
+  }
 
   // Outputs: varyings or colour targets in Location order, then position / depth / coverage. Unwritten
   // builtins are dropped when the module does not write them.
@@ -1014,6 +1058,11 @@ void Translator::buildSignature() {
               {S("air.depth"), S("air.depth_qualifier"), S(depthQualifier_), S("air.arg_type_name"), S("float"),
                S("air.arg_name"), S("depth")},
               false);
+  if (fragStencil != kNone && stored_[fragStencil]) {
+    if (llvmType(type(varType_[fragStencil]).elem) != i32_) fail("gl_FragStencilRefEXT type");
+    addOutput(fragStencil, -1, i32_,
+              {S("air.stencil"), S("air.arg_type_name"), S("uint"), S("air.arg_name"), S("stencil")}, false);
+  }
   if (sampleMask != kNone && stored_[sampleMask])
     addOutput(sampleMask, 0, i32_, {S("air.sample_mask"), S("air.arg_type_name"), S("uint"), S("air.arg_name"),
                                     S("sample_mask")}, false);
@@ -1056,22 +1105,77 @@ const ResourceBinding& Translator::binding(uint32_t var) const {
   fail("no binding for descriptor set " + std::to_string(d.set) + " binding " + std::to_string(d.binding));
 }
 
+void Translator::addDirectResourceArg(uint32_t var) {
+  auto S = [&](const std::string& s) { return m_.mdString(s); };
+  auto I = [&](int64_t v) { return m_.mdValue(m_.constInt(i32_, v)); };
+  const SType& pt = type(varType_[var]);
+  const Decorations& d = decor_[var];
+  std::string what = "variable %" + std::to_string(var);
+  auto bufferArg = [&](unsigned index, unsigned addrSpace, bool readOnly) {
+    argOfInput_[var] = int(
+        addArg(m_.ptrTy(i8_, addrSpace),
+               {S("air.buffer"), S("air.location_index"), I(index), I(1), S(readOnly ? "air.read" : "air.read_write"),
+                S("air.address_space"), I(addrSpace), S("air.arg_type_size"), I(1), S("air.arg_type_align_size"),
+                I(1), S("air.arg_type_name"), S("uchar"), S("air.arg_name"), S("buffer" + std::to_string(index))}));
+  };
+  switch (pt.storage) {
+    case spv::StorageClassStorageBuffer:
+      bufferArg(binding(var).buffer, 1, memberDecor_[pt.elem].nonWritable || d.nonWritable);
+      break;
+    case spv::StorageClassUniform:
+      // BufferBlock is the SPIR-V 1.0 spelling of a StorageBuffer block; a plain Block is a uniform buffer.
+      if (decor_[pt.elem].bufferBlock)
+        bufferArg(binding(var).buffer, 1, memberDecor_[pt.elem].nonWritable || d.nonWritable);
+      else
+        bufferArg(binding(var).buffer, 2, true);
+      break;
+    case spv::StorageClassPushConstant:
+      if (options_.pushConstantBuffer < 0) fail("push constants without Options::pushConstantBuffer");
+      bufferArg(uint32_t(options_.pushConstantBuffer), 2, true);
+      break;
+    case spv::StorageClassUniformConstant: {
+      const SType& image = type(pt.elem);
+      if (image.op != spv::OpTypeImage) fail("resource " + what);
+      const SType& texel = type(image.elem);
+      std::string component = texel.op == spv::OpTypeFloat ? "float" : texel.isSigned ? "int" : "uint";
+      unsigned index = binding(var).texture;
+      const char* access;
+      const char* prefix;
+      Type* texTy = nullptr;
+      if (image.storageImage) {
+        access = "write";
+        prefix = image.arrayed ? "texture2d_array<" : "texture2d<";
+        Type*& slot = image.arrayed ? tex2dArray_ : tex2d_;
+        if (!slot) slot = m_.structTy(image.arrayed ? "struct._texture_2d_array_t" : "struct._texture_2d_t");
+        texTy = slot;
+      } else {
+        // A multisampled texture can only be declared read; a plain one is sampled-image access.
+        access = image.multisampled ? "read" : "sample";
+        prefix = image.multisampled ? "texture2d_ms<" : "texture2d<";
+        Type*& slot = image.multisampled ? tex2dMs_ : tex2d_;
+        if (!slot) slot = m_.structTy(image.multisampled ? "struct._texture_2d_ms_t" : "struct._texture_2d_t");
+        texTy = slot;
+      }
+      argOfInput_[var] = int(addArg(
+          m_.ptrTy(texTy, 1),
+          {S("air.texture"), S("air.location_index"), I(index), I(1), S(std::string("air.") + access),
+           S("air.arg_type_name"), S(std::string(prefix) + component + ", " + access + ">"),
+           S("air.arg_name"), S("texture" + std::to_string(index))}));
+      break;
+    }
+    default:
+      fail("storage class " + std::to_string(pt.storage) + " of " + what);
+  }
+}
+
 // The arguments of the kernel: one per resource and builtin, with the metadata MSL gives a plain
 // `device uchar*` / `constant uchar*` / `texture2d<T, access>` / `uint3 [[builtin]]` argument.
 void Translator::buildComputeSignature() {
   auto S = [&](const std::string& s) { return m_.mdString(s); };
-  auto I = [&](int64_t v) { return m_.mdValue(m_.constInt(i32_, v)); };
   for (uint32_t var : globals_) {
     const SType& pt = type(varType_[var]);
     const Decorations& d = decor_[var];
     std::string what = "variable %" + std::to_string(var);
-    auto bufferArg = [&](unsigned index, unsigned addrSpace, bool readOnly) {
-      argOfInput_[var] = int(
-          addArg(m_.ptrTy(i8_, addrSpace),
-                 {S("air.buffer"), S("air.location_index"), I(index), I(1), S(readOnly ? "air.read" : "air.read_write"),
-                  S("air.address_space"), I(addrSpace), S("air.arg_type_size"), I(1), S("air.arg_type_align_size"),
-                  I(1), S("air.arg_type_name"), S("uchar"), S("air.arg_name"), S("buffer" + std::to_string(index))}));
-    };
     switch (pt.storage) {
       case spv::StorageClassInput: {
         const char* air = nullptr;
@@ -1104,37 +1208,11 @@ void Translator::buildComputeSignature() {
         break;
       }
       case spv::StorageClassStorageBuffer:
-        bufferArg(binding(var).buffer, 1, memberDecor_[pt.elem].nonWritable || d.nonWritable);
-        break;
       case spv::StorageClassUniform:
-        // BufferBlock is the SPIR-V 1.0 spelling of a StorageBuffer block; a plain Block is a uniform buffer.
-        if (decor_[pt.elem].bufferBlock)
-          bufferArg(binding(var).buffer, 1, memberDecor_[pt.elem].nonWritable || d.nonWritable);
-        else
-          bufferArg(binding(var).buffer, 2, true);
-        break;
       case spv::StorageClassPushConstant:
-        if (options_.pushConstantBuffer < 0) fail("push constants without Options::pushConstantBuffer");
-        bufferArg(uint32_t(options_.pushConstantBuffer), 2, true);
+      case spv::StorageClassUniformConstant:
+        addDirectResourceArg(var);
         break;
-      case spv::StorageClassUniformConstant: {
-        const SType& image = type(pt.elem);
-        if (image.op != spv::OpTypeImage) fail("resource " + what);
-        const SType& texel = type(image.elem);
-        std::string component = texel.op == spv::OpTypeFloat ? "float" : texel.isSigned ? "int" : "uint";
-        // A multisampled texture can only be declared read; a plain one is sampled-image access.
-        const char* access = image.multisampled ? "read" : "sample";
-        unsigned index = binding(var).texture;
-        Type*& texTy = image.multisampled ? tex2dMs_ : tex2d_;
-        if (!texTy) texTy = m_.structTy(image.multisampled ? "struct._texture_2d_ms_t" : "struct._texture_2d_t");
-        argOfInput_[var] = int(addArg(
-            m_.ptrTy(texTy, 1),
-            {S("air.texture"), S("air.location_index"), I(index), I(1), S(std::string("air.") + access),
-             S("air.arg_type_name"),
-             S(std::string(image.multisampled ? "texture2d_ms<" : "texture2d<") + component + ", " + access + ">"),
-             S("air.arg_name"), S("texture" + std::to_string(index))}));
-        break;
-      }
       case spv::StorageClassWorkgroup:
       case spv::StorageClassPrivate:
         break;
@@ -1218,6 +1296,13 @@ void Translator::buildEntry() {
     p.variable = var;
     switch (pt.storage) {
       case spv::StorageClassUniform:
+        if (directBindings()) {
+          p.kind = Pointer::Buffer;
+          p.ptr = main_->args[argOfInput_.at(var)];
+          p.addrSpace = p.ptr->type->n;
+          p.offset = m_.constInt(i64_, 0);
+          break;
+        }
         if (isFunctionConstant(var)) {
           p.kind = Pointer::FunctionConstant;
           break;
@@ -1228,6 +1313,13 @@ void Translator::buildEntry() {
         p.offset = m_.constInt(i64_, 0);
         break;
       case spv::StorageClassStorageBuffer: {
+        if (directBindings()) {
+          p.kind = Pointer::Buffer;
+          p.ptr = main_->args[argOfInput_.at(var)];
+          p.addrSpace = p.ptr->type->n;
+          p.offset = m_.constInt(i64_, 0);
+          break;
+        }
         bool readOnly = memberDecor_[pt.elem].nonWritable;
         p.kind = Pointer::Buffer;
         p.addrSpace = 1;
@@ -1241,9 +1333,29 @@ void Translator::buildEntry() {
         p.offset = m_.constInt(i64_, 0);
         break;
       }
+      case spv::StorageClassPushConstant:
+        p.kind = Pointer::Buffer;
+        p.ptr = main_->args[argOfInput_.at(var)];
+        p.addrSpace = p.ptr->type->n;
+        p.offset = m_.constInt(i64_, 0);
+        break;
       case spv::StorageClassUniformConstant:
+        if (directBindings()) {
+          p.kind = Pointer::Resource;
+          p.ptr = main_->args[argOfInput_.at(var)];
+          break;
+        }
         p.kind = attachmentArgs_.count(var) ? Pointer::Attachment : Pointer::Resource;
         break;
+      case spv::StorageClassPrivate: {
+        Type* t = llvmType(pt.elem);
+        p.kind = Pointer::Private;
+        if (varInit_.count(var) && readOnlyTable(var, val(varInit_.at(var)), p)) break;
+        p.ptr = entryB_->allocaInst(t, 16);
+        Value* init = varInit_.count(var) ? val(varInit_.at(var)) : m_.constNull(t);
+        entryB_->store(init, p.ptr, 4);
+        break;
+      }
       case spv::StorageClassInput:
       case spv::StorageClassOutput: {
         Type* t = llvmType(pt.elem);
@@ -1676,7 +1788,7 @@ Pointer Translator::accessChain(const Pointer& base, const uint32_t* idx, unsign
 }
 
 Value* Translator::loadResource(const Pointer& p) {
-  if (compute()) return p.ptr;  // the texture argument itself
+  if (directBindings()) return p.ptr;  // the texture argument itself
   const Decorations& d = decor_[p.variable];
   const SType& t = type(p.type);
   bool sampler = t.op == spv::OpTypeSampler;
@@ -1744,6 +1856,9 @@ Function* Translator::declare(const std::string& name, Type* ret, const std::vec
       case AttrClass::TextureRead:
         a = {Attr::get("argmemonly"), Attr::get("mustprogress"), Attr::get("nofree"),
              Attr::get("nounwind"),   Attr::get("readonly"),     Attr::get("willreturn")};
+        break;
+      case AttrClass::TextureWrite:
+        a = {Attr::get("argmemonly"), Attr::get("mustprogress"), Attr::get("nounwind"), Attr::get("willreturn")};
         break;
       case AttrClass::Derivative:
       case AttrClass::Barrier:
@@ -2302,6 +2417,9 @@ void Translator::translate(const Inst& in) {
     }
     case spv::OpImageFetch:
       set(fetch(in));
+      break;
+    case spv::OpImageWrite:
+      imageWrite(in);
       break;
     case spv::OpMemoryBarrier:
       fail("memory barrier requires Metal 3.2 atomic fences");
@@ -3046,10 +3164,11 @@ void Translator::controlBarrier(const Inst& in) {
 
 // OpImageFetch of a sampled 2D image, optionally multisampled: texture.read(coordinate, lod or sample).
 Value* Translator::fetch(const Inst& in) {
-  if (!compute()) fail("OpImageFetch outside compute");
+  if (!directBindings()) fail("OpImageFetch requires direct bindings");
   auto it = loadedImageType_.find(in.operand(2));
   if (it == loadedImageType_.end()) fail("fetch from something other than a loaded image variable");
   const SType& image = type(it->second);
+  if (image.storageImage) fail("OpImageFetch on a storage image");
   const SType& texel = type(image.elem);
   uint32_t mask = in.wc > 5 ? in.operand(4) : 0;
   if (mask & ~uint32_t(spv::ImageOperandsLodMask | spv::ImageOperandsSampleMask)) fail("fetch operands");
@@ -3067,6 +3186,50 @@ Value* Translator::fetch(const Inst& in) {
                        {val(in.operand(2)), val(in.operand(3)), index, cint(image.multisampled ? 1 : 0)},
                        AttrClass::TextureRead);
   return b_->extractValue(r, {0});
+}
+
+// OpImageWrite to a 2D or 2DArray storage image: texture.write(texel, coordinate[, array_index]).
+void Translator::imageWrite(const Inst& in) {
+  if (!directBindings()) fail("OpImageWrite requires direct bindings");
+  if (in.wc > 4 && in.operand(3) != 0) fail("OpImageWrite image operands");
+  auto it = loadedImageType_.find(in.operand(0));
+  if (it == loadedImageType_.end()) fail("image write to something other than a loaded image variable");
+  const SType& image = type(it->second);
+  if (!image.storageImage || image.dim != spv::Dim2D) fail("OpImageWrite on non-2D storage image");
+  const SType& texelType = type(image.elem);
+  bool isFloat = texelType.op == spv::OpTypeFloat;
+  Type* elem = isFloat ? f32_ : i32_;
+  Type* vec4 = m_.vecTy(elem, 4);
+  Value* coord = val(in.operand(1));
+  Value* texel = val(in.operand(2));
+  if (texel->type != vec4) {
+    Value* padded = m_.constNull(vec4);
+    if (texel->type == elem) {
+      padded = b_->insertElement(padded, texel, cint(0));
+    } else if (texel->type->kind == Type::Vector && texel->type->elem == elem && texel->type->n < 4) {
+      for (unsigned c = 0; c < texel->type->n; ++c)
+        padded = b_->insertElement(padded, b_->extractElement(texel, cint(c)), cint(c));
+    } else {
+      fail("OpImageWrite texel type does not match image");
+    }
+    texel = padded;
+  }
+  std::string name = std::string("air.write_texture_2d") + (image.arrayed ? "_array" : "") + "." +
+                     (isFloat              ? ""
+                      : texelType.isSigned ? "s."
+                                           : "u.") +
+                     (isFloat ? "v4f32" : "v4i32");
+  // The last two immediates are lod (0) and the texture's declared access (write = 2).
+  if (image.arrayed) {
+    if (coord->type != m_.vecTy(i32_, 3)) fail("OpImageWrite 2DArray coordinate must be int3/uint3");
+    Constant* xyMask = m_.constAggregate(m_.vecTy(i32_, 2), {m_.constInt(i32_, 0), m_.constInt(i32_, 1)});
+    Value* xy = b_->shuffleVector(coord, coord, xyMask);
+    Value* slice = b_->extractElement(coord, cint(2));
+    intrinsic(name, m_.voidTy(), {val(in.operand(0)), xy, slice, texel, cint(0), cint(2)}, AttrClass::TextureWrite);
+  } else {
+    if (coord->type != m_.vecTy(i32_, 2)) fail("OpImageWrite 2D coordinate must be int2/uint2");
+    intrinsic(name, m_.voidTy(), {val(in.operand(0)), coord, texel, cint(0), cint(2)}, AttrClass::TextureWrite);
+  }
 }
 
 // The array layer of an image sample: SPIR-V (and Vulkan) take clamp(RoundEven(coordinate), 0, layers - 1). rint is the

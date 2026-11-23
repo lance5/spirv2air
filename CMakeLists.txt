@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(spirv2air VERSION 1.0.8 LANGUAGES CXX)
+project(spirv2air VERSION 1.0.9 LANGUAGES CXX)
 if(NOT APPLE)
   message(FATAL_ERROR "This version requires the macOS SDK (CommonCrypto).")
 endif()
@@ -93,6 +93,9 @@ if(BUILD_TESTING AND SPIRV2AIR_BUILD_TESTS)
   assemble(atomic_extra compute/atomic_extra.spvasm vulkan1.1)
   assemble(tables compute/tables.spvasm vulkan1.1)
   assemble(lanes compute/lanes.spvasm vulkan1.1)
+  assemble(image_write compute/image_write.spvasm vulkan1.1)
+  assemble(direct_stencil frag/direct_stencil.frag.spvasm vulkan1.1)
+  assemble(direct_half frag/direct_half.frag.spvasm vulkan1.1)
   assemble(dispatch dispatch/dispatch.spvasm vulkan1.1)
   assemble(quad tess/quad.tese.spvasm vulkan1.1)
   assemble(triangle tess/triangle.tese.spvasm vulkan1.1)
@@ -139,7 +142,8 @@ if(BUILD_TESTING AND SPIRV2AIR_BUILD_TESTS)
                                    ${glslext_comp_SPV} ${glslext_frag_SPV} ${atomic_extra_SPV} ${fetchstate_SPV} ${tilecull_SPV} ${barycentric_SPV} ${ordered_SPV} ${interpolate_SPV}
                                    ${rastercentroid_SPV}
                                    ${tables_SPV} ${dropped_SPV} ${guard_frag_SPV} ${guard_vert_SPV} ${guard_comp_SPV}
-                                   ${forward_vert_SPV} ${lanes_SPV} ${keepbranch_SPV})
+                                   ${forward_vert_SPV} ${lanes_SPV} ${keepbranch_SPV}
+                                   ${image_write_SPV} ${direct_stencil_SPV} ${direct_half_SPV})
   add_executable(cpu_tests tests/cpu_tests.cpp)
   target_link_libraries(cpu_tests PRIVATE spirv2air airkit)
   add_dependencies(cpu_tests test_data)
@@ -237,6 +241,30 @@ if(BUILD_TESTING AND SPIRV2AIR_BUILD_TESTS)
         -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/apple-tools-interpolate
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/apple_validate.cmake)
       set_tests_properties(apple_tools_interpolate PROPERTIES LABELS CPU)
+      add_test(NAME apple_tools_direct_write COMMAND ${CMAKE_COMMAND}
+        -DCLI=$<TARGET_FILE:spirv2air_cli> -DINPUT=${image_write_SPV}
+        "-DARGS=--texture;0:0:0;--texture;0:1:1;--texture;0:2:2"
+        "-DEXPECT=@air.write_texture_2d_array.u.v4i32"
+        -DVALIDATE=${s2a_validate} -DOBJDUMP=${s2a_objdump}
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/apple-tools-direct-write
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/apple_validate.cmake)
+      set_tests_properties(apple_tools_direct_write PROPERTIES LABELS CPU)
+      add_test(NAME apple_tools_direct_stencil COMMAND ${CMAKE_COMMAND}
+        -DCLI=$<TARGET_FILE:spirv2air_cli> -DINPUT=${direct_stencil_SPV}
+        "-DARGS=--direct-bindings;--push-constant;0;--buffer;0:0:1;--texture;1:0:2"
+        "-DEXPECT=!\"air.stencil\""
+        -DVALIDATE=${s2a_validate} -DOBJDUMP=${s2a_objdump}
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/apple-tools-direct-stencil
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/apple_validate.cmake)
+      set_tests_properties(apple_tools_direct_stencil PROPERTIES LABELS CPU)
+      add_test(NAME apple_tools_direct_half COMMAND ${CMAKE_COMMAND}
+        -DCLI=$<TARGET_FILE:spirv2air_cli> -DINPUT=${direct_half_SPV}
+        "-DARGS=--direct-bindings;--push-constant;0"
+        "-DEXPECT=!\"half4\""
+        -DVALIDATE=${s2a_validate} -DOBJDUMP=${s2a_objdump}
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/apple-tools-direct-half
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/apple_validate.cmake)
+      set_tests_properties(apple_tools_direct_half PROPERTIES LABELS CPU)
     endif()
     add_test(NAME cpu_strictmul_none COMMAND spirv2air_cli ${strictmul_none_SPV}
       ${CMAKE_CURRENT_BINARY_DIR}/strictmul-none.metallib --buffer 0:0:0 --buffer 0:1:1)
@@ -256,7 +284,7 @@ if(BUILD_TESTING AND SPIRV2AIR_BUILD_TESTS)
   if(SPIRV2AIR_BUILD_GPU_TESTS)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 17)
-    foreach(name airkit compute tess frag cull dispatch tex math fc tilecull flat barycentric ordered interpolate centroid feedback fold forward)
+    foreach(name airkit compute tess frag cull dispatch tex math fc tilecull flat barycentric ordered interpolate centroid feedback fold forward direct)
       add_executable(${name}_gpu tests/${name}_gpu.mm)
       target_link_libraries(${name}_gpu PRIVATE spirv2air airkit "-framework Metal" "-framework Foundation")
       target_compile_options(${name}_gpu PRIVATE -fobjc-arc)
@@ -290,7 +318,8 @@ if(BUILD_TESTING AND SPIRV2AIR_BUILD_TESTS)
     add_test(NAME tilecull_gpu COMMAND tilecull_gpu ${tilecull_SPV})
     add_test(NAME tex_gpu COMMAND tex_gpu ${layer2da_SPV} ${tex2d_SPV} ${cube_SPV} ${cubearray_SPV} ${tex3d_SPV}
       ${layer2dagrad_SPV} ${cubegrad_SPV} ${tex3dgrad_SPV} ${lodbias_SPV})
+    add_test(NAME direct_gpu COMMAND direct_gpu ${image_write_SPV} ${direct_stencil_SPV} ${direct_half_SPV})
     set_tests_properties(airkit_gpu fold_gpu forward_gpu compute_gpu tess_gpu frag_gpu strict_math_gpu strict_fma_gpu cull_gpu dispatch_gpu tex_gpu math_gpu fc_gpu tilecull_gpu flat_gpu barycentric_gpu ordered_gpu
-                         interpolate_gpu centroid_gpu PROPERTIES LABELS GPU RUN_SERIAL TRUE)
+                         interpolate_gpu centroid_gpu direct_gpu PROPERTIES LABELS GPU RUN_SERIAL TRUE)
   endif()
 endif()

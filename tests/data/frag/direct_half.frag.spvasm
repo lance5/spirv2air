@@ -1,0 +1,53 @@
+; Direct-binding fragment shader with StorageClassPrivate + Float16/StorageInputOutput16 half4 color output.
+               OpCapability Shader
+               OpCapability Float16
+               OpCapability StorageInputOutput16
+               OpExtension "SPV_KHR_16bit_storage"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out_half4
+               OpExecutionMode %main OriginUpperLeft
+
+               OpDecorate %out_half4 Location 0
+               OpDecorate %pc_block Block
+               OpMemberDecorate %pc_block 0 Offset 0
+
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+       %half = OpTypeFloat 16
+     %v2half = OpTypeVector %half 2
+     %v4half = OpTypeVector %half 4
+     %v4uint = OpTypeVector %uint 4
+
+   %pc_block = OpTypeStruct %v4uint
+       %p_pc = OpTypePointer PushConstant %pc_block
+   %p_pc_v4u = OpTypePointer PushConstant %v4uint
+  %p_priv_v4 = OpTypePointer Private %v4uint
+  %p_out_v4h = OpTypePointer Output %v4half
+
+         %pc = OpVariable %p_pc PushConstant
+  %priv_bits = OpVariable %p_priv_v4 Private
+  %out_half4 = OpVariable %p_out_v4h Output
+
+        %i_0 = OpConstant %int 0
+       %u_16 = OpConstant %uint 16
+
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+     %pc_ptr = OpAccessChain %p_pc_v4u %pc %i_0
+       %bits = OpLoad %v4uint %pc_ptr
+               OpStore %priv_bits %bits
+     %loaded = OpLoad %v4uint %priv_bits
+         %c0 = OpCompositeExtract %uint %loaded 0
+         %c1 = OpCompositeExtract %uint %loaded 1
+         %c2 = OpCompositeExtract %uint %loaded 2
+         %c3 = OpCompositeExtract %uint %loaded 3
+       %p01u = OpBitFieldInsert %uint %c0 %c1 %u_16 %u_16
+       %p23u = OpBitFieldInsert %uint %c2 %c3 %u_16 %u_16
+        %h01 = OpBitcast %v2half %p01u
+        %h23 = OpBitcast %v2half %p23u
+        %out = OpCompositeConstruct %v4half %h01 %h23
+               OpStore %out_half4 %out
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,79 @@
+; OpImageWrite to 2DArray uint, 2DArray float, and 2D uint storage images.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 4 4 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %tu_arr DescriptorSet 0
+               OpDecorate %tu_arr Binding 0
+               OpDecorate %tu_arr NonReadable
+               OpDecorate %tf_arr DescriptorSet 0
+               OpDecorate %tf_arr Binding 1
+               OpDecorate %tf_arr NonReadable
+               OpDecorate %tu_2d DescriptorSet 0
+               OpDecorate %tu_2d Binding 2
+               OpDecorate %tu_2d NonReadable
+
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+      %v2int = OpTypeVector %int 2
+      %v3int = OpTypeVector %int 3
+     %v3uint = OpTypeVector %uint 3
+     %v4uint = OpTypeVector %uint 4
+    %v4float = OpTypeVector %float 4
+
+%img_u_arr_t = OpTypeImage %uint 2D 0 1 0 2 Rg32ui
+%img_f_arr_t = OpTypeImage %float 2D 0 1 0 2 R32f
+ %img_u_2d_t = OpTypeImage %uint 2D 0 0 0 2 R32ui
+
+%p_in_v3u    = OpTypePointer Input %v3uint
+%p_uc_u_arr  = OpTypePointer UniformConstant %img_u_arr_t
+%p_uc_f_arr  = OpTypePointer UniformConstant %img_f_arr_t
+%p_uc_u_2d   = OpTypePointer UniformConstant %img_u_2d_t
+
+        %gid = OpVariable %p_in_v3u Input
+     %tu_arr = OpVariable %p_uc_u_arr UniformConstant
+     %tf_arr = OpVariable %p_uc_f_arr UniformConstant
+      %tu_2d = OpVariable %p_uc_u_2d UniformConstant
+
+       %u_0  = OpConstant %uint 0
+       %u_1  = OpConstant %uint 1
+      %u_10  = OpConstant %uint 10
+     %u_100  = OpConstant %uint 100
+       %i_0  = OpConstant %int 0
+       %i_1  = OpConstant %int 1
+       %f_0  = OpConstant %float 0.0
+      %f_025 = OpConstant %float 0.25
+
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3uint %gid
+         %gx = OpCompositeExtract %uint %g 0
+         %gy = OpCompositeExtract %uint %g 1
+         %ix = OpBitcast %int %gx
+         %iy = OpBitcast %int %gy
+        %c2d = OpCompositeConstruct %v2int %ix %iy
+        %c3d = OpCompositeConstruct %v3int %ix %iy %i_1
+
+         %v0 = OpIAdd %uint %gx %u_10
+         %v1 = OpIAdd %uint %gy %u_100
+         %vu = OpCompositeConstruct %v4uint %v0 %v1 %u_0 %u_0
+        %u2a = OpLoad %img_u_arr_t %tu_arr
+               OpImageWrite %u2a %c3d %vu
+
+        %sum = OpIAdd %uint %gx %gy
+        %fsv = OpConvertUToF %float %sum
+        %fv0 = OpFMul %float %fsv %f_025
+         %vf = OpCompositeConstruct %v4float %fv0 %f_0 %f_0 %f_0
+        %f2a = OpLoad %img_f_arr_t %tf_arr
+               OpImageWrite %f2a %c3d %vf
+
+        %v2d = OpIAdd %uint %v0 %v1
+       %vu2d = OpCompositeConstruct %v4uint %v2d %u_0 %u_0 %u_0
+        %u2d = OpLoad %img_u_2d_t %tu_2d
+               OpImageWrite %u2d %c2d %vu2d
+               OpReturn
+               OpFunctionEnd

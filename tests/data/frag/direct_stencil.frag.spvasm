@@ -1,0 +1,94 @@
+; Direct-binding fragment shader: OpImageFetch (2D uint) + BufferBlock + PushConstant -> FragDepth + FragStencilRefEXT.
+               OpCapability Shader
+               OpCapability StencilExportEXT
+               OpExtension "SPV_EXT_shader_stencil_export"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %frag_coord %out_depth %out_stencil
+               OpExecutionMode %main OriginUpperLeft
+               OpExecutionMode %main DepthReplacing
+               OpExecutionMode %main StencilRefReplacingEXT
+
+               OpDecorate %frag_coord BuiltIn FragCoord
+               OpDecorate %out_depth BuiltIn FragDepth
+               OpDecorate %out_stencil BuiltIn FragStencilRefEXT
+
+               OpDecorate %pc_block Block
+               OpMemberDecorate %pc_block 0 Offset 0
+               OpDecorate %buf_arr ArrayStride 4
+               OpDecorate %buf_block BufferBlock
+               OpMemberDecorate %buf_block 0 Offset 0
+               OpMemberDecorate %buf_block 0 NonWritable
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+               OpDecorate %tex DescriptorSet 1
+               OpDecorate %tex Binding 0
+
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+      %v2int = OpTypeVector %int 2
+     %v4uint = OpTypeVector %uint 4
+    %v4float = OpTypeVector %float 4
+
+   %pc_block = OpTypeStruct %v4uint
+    %buf_arr = OpTypeRuntimeArray %uint
+  %buf_block = OpTypeStruct %buf_arr
+      %img_t = OpTypeImage %uint 2D 0 0 0 1 Unknown
+
+  %p_in_v4f  = OpTypePointer Input %v4float
+  %p_out_f   = OpTypePointer Output %float
+  %p_out_i   = OpTypePointer Output %int
+  %p_pc      = OpTypePointer PushConstant %pc_block
+  %p_pc_v4u  = OpTypePointer PushConstant %v4uint
+  %p_buf     = OpTypePointer Uniform %buf_block
+  %p_buf_u   = OpTypePointer Uniform %uint
+  %p_uc_img  = OpTypePointer UniformConstant %img_t
+
+ %frag_coord = OpVariable %p_in_v4f Input
+  %out_depth = OpVariable %p_out_f Output
+%out_stencil = OpVariable %p_out_i Output
+         %pc = OpVariable %p_pc PushConstant
+        %buf = OpVariable %p_buf Uniform
+        %tex = OpVariable %p_uc_img UniformConstant
+
+        %i_0 = OpConstant %int 0
+        %u_0 = OpConstant %uint 0
+        %u_4 = OpConstant %uint 4
+       %u_ff = OpConstant %uint 255
+      %f_inv = OpConstant %float 0.0625
+
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %fc = OpLoad %v4float %frag_coord
+        %fcx = OpCompositeExtract %float %fc 0
+        %fcy = OpCompositeExtract %float %fc 1
+         %ux = OpConvertFToU %uint %fcx
+         %uy = OpConvertFToU %uint %fcy
+         %ix = OpBitcast %int %ux
+         %iy = OpBitcast %int %uy
+      %coord = OpCompositeConstruct %v2int %ix %iy
+
+        %img = OpLoad %img_t %tex
+       %ftex = OpImageFetch %v4uint %img %coord Lod %i_0
+       %tex0 = OpCompositeExtract %uint %ftex 0
+
+     %pc_ptr = OpAccessChain %p_pc_v4u %pc %i_0
+      %pcval = OpLoad %v4uint %pc_ptr
+        %pc0 = OpCompositeExtract %uint %pcval 0
+
+        %idx = OpIAdd %uint %ux %uy
+    %buf_ptr = OpAccessChain %p_buf_u %buf %i_0 %idx
+       %bval = OpLoad %uint %buf_ptr
+
+      %depth = OpFMul %float %f_inv %fcx
+               OpStore %out_depth %depth
+
+       %sum1 = OpIAdd %uint %tex0 %bval
+       %sum2 = OpIAdd %uint %sum1 %pc0
+      %stenc = OpBitwiseAnd %uint %sum2 %u_ff
+     %stenci = OpBitcast %int %stenc
+               OpStore %out_stencil %stenci
+               OpReturn
+               OpFunctionEnd

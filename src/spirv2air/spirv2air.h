@@ -1,7 +1,8 @@
 // spirv2air: SPIR-V -> Apple AIR -> metallib.
 //
-// Vertex, fragment and tessellation-evaluation modules use the graphics argument-buffer layout in Options.
-// GLCompute modules use direct Metal resource bindings. The output entry point is named "main".
+// Vertex, fragment and tessellation-evaluation modules use the graphics argument-buffer layout in Options
+// unless Options::directBindings is set on a fragment module. GLCompute modules always use direct Metal
+// resource bindings. The output entry point is named "main".
 // Unsupported constructs return a diagnostic in Result::error. See the public README for the supported subset.
 #pragma once
 #include <cstddef>
@@ -15,7 +16,7 @@ namespace spirv2air {
 
 // Identifies the output format for caches: two builds with the same kVersion must produce byte-identical output
 // for the same input. Bump it with every change that changes any output byte.
-inline constexpr char kVersion[] = "spirv2air 1.0.8";
+inline constexpr char kVersion[] = "spirv2air 1.0.9";
 
 // Non-semantic extended instruction set read by spirv2air (SPV_KHR_non_semantic_info; other consumers ignore it).
 // KeepBranch (no operands; result type void) in a block makes the conditional branch ending that block reach the
@@ -30,13 +31,14 @@ struct Result {
   bool ok() const { return error.empty(); }
 };
 
-// Where one SPIR-V (descriptor set, binding) goes in a direct-binding module (GLCompute). This has the shape of
-// SPIRV-Cross's MSLResourceBinding: the kind of the variable at (set, binding) selects which index is used, so one
-// entry can serve a buffer and a texture that share a (set, binding) across modules.
+// Where one SPIR-V (descriptor set, binding) goes in a direct-binding module (GLCompute, or Fragment with
+// Options::directBindings). This has the shape of SPIRV-Cross's MSLResourceBinding: the kind of the variable
+// at (set, binding) selects which index is used, so one entry can serve a buffer and a texture that share a
+// (set, binding) across modules.
 struct ResourceBinding {
   uint32_t set = 0, binding = 0;
   uint32_t buffer = 0;   // [[buffer(n)]]: storage buffers, and uniform buffers
-  uint32_t texture = 0;  // [[texture(n)]]: sampled images
+  uint32_t texture = 0;  // [[texture(n)]]: sampled images and storage images
 };
 
 // Graphics resource layout. Defaults preserve the original xenia integration contract. This is a host ABI,
@@ -113,10 +115,13 @@ struct Options {
   // iOS floor; older versions are raised to it. The AIR version follows it as Apple's compiler does: macOS 2.6 up to
   // 14, 2.7 for 15, 2.8 from 26; iOS 2.7 for 18, 2.8 from 26.
   uint16_t minOsMajor = 0, minOsMinor = 0;
-  // Used by GLCompute modules. A resource without an entry is an error.
+  // Used by GLCompute modules, and by Fragment modules when directBindings is true. A resource without an entry is an error.
   std::vector<ResourceBinding> bindings;
   // [[buffer(n)]] of the push constant block (a constant-address-space buffer; bind it with setBytes). -1: none.
   int pushConstantBuffer = -1;
+  // Use direct Metal resource bindings (Options::bindings and pushConstantBuffer) instead of the graphics
+  // argument-buffer layout on Fragment modules. Ignored by GLCompute (which always uses direct bindings).
+  bool directBindings = false;
   // Thread constant jumps through a switch-based dispatch loop (including the Xenos loop emitted by xenia).
   // Enabled by default; disabling preserves the original dispatch control flow. This option affects output bytes.
   bool jumpThread = true;
