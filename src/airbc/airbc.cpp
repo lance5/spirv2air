@@ -51,6 +51,7 @@ const AttrInfo kAttrs[] = {
     {"signext", "SExt", 24, 0},                 {"speculatable", "Speculatable", 53, 0},
     {"willreturn", "WillReturn", 61, 0},        {"writeonly", "WriteOnly", 52, 0},
     {"zeroext", "ZExt", 34, 0},
+    {"byval", "ByVal", 3, 1},
     {"align", "Alignment", 1, 2},               {"dereferenceable", "Dereferenceable", 41, 2},
     {"dereferenceable_or_null", "DereferenceableOrNull", 42, 2},
 };
@@ -66,13 +67,19 @@ Attr Attr::get(const char *name, uint64_t intValue) {
   for (const AttrInfo &a : kAttrs)
     if (!std::strcmp(a.ir, name)) {
       Attr r;
-      r.cls = a.cls == 2 ? Int : Enum;
+      r.cls = a.cls == 2 ? Int : a.cls == 1 ? Typed : Enum;
       r.code = a.code;
       r.rank = attrRank(a);
       r.value = intValue;
       return r;
     }
   throw std::runtime_error(std::string("airbc: unknown attribute ") + name);
+}
+
+Attr Attr::typed(const char *name, const Type *type) {
+  Attr r = get(name);
+  r.type = type;
+  return r;
 }
 
 Attr Attr::str(std::string k, std::string v) {
@@ -85,9 +92,13 @@ Attr Attr::str(std::string k, std::string v) {
 
 // AttributeImpl::operator<: enum/int kinds numerically, then string attributes lexicographically.
 bool Attr::operator<(const Attr &o) const {
-  bool s = cls >= Str, os = o.cls >= Str;
+  bool s = cls == Str || cls == StrVal, os = o.cls == Str || o.cls == StrVal;
   if (s != os) return !s;
-  if (!s) return rank != o.rank ? rank < o.rank : value < o.value;
+  if (!s) {
+    if (rank != o.rank) return rank < o.rank;
+    if (value != o.value) return value < o.value;
+    return std::less<const Type *>{}(type, o.type);
+  }
   return key != o.key ? key < o.key : val < o.val;
 }
 
@@ -403,6 +414,17 @@ Function *Module::addFunction(const std::string &name, Type *fty) {
   functions.push_back(f);
   return f;
 }
+void Module::appendFunctionArguments(Function *f, const std::vector<Type *> &types) {
+  if (types.empty()) return;
+  auto parameters = f->fty->elems;
+  for (Type *type : types) {
+    f->args.push_back(make<Argument>(type, static_cast<unsigned>(parameters.size())));
+    parameters.push_back(type);
+  }
+  f->fty = fnTy(f->fty->elem, std::move(parameters), f->fty->vararg);
+  f->type = ptrTy(f->fty, 0);
+}
+
 BasicBlock *Module::addBlock(Function *f, const std::string &name) {
   BasicBlock *bb = make<BasicBlock>(label_);
   bb->name = name;
@@ -416,7 +438,7 @@ Instruction *Module::newInst(Op op, Type *t) {
 
 static std::string attrKey(const Attr &a) {
   return std::to_string(a.cls) + ":" + std::to_string(a.code) + ":" + std::to_string(a.value) + ":" + a.key +
-         '\0' + a.val + '\0';
+         '\0' + a.val + '\0' + ptrKey(a.type);
 }
 const AttrSet *Module::attrSet(std::vector<Attr> attrs) {
   std::sort(attrs.begin(), attrs.end());
@@ -1146,6 +1168,8 @@ private:
       if (!g) {
         attrGroups.push_back(p);
         g = unsigned(attrGroups.size());
+        for (const Attr &attr : *p.second)
+          if (attr.cls == Attr::Typed) enumType(attr.type);
       }
     }
   }
@@ -1451,6 +1475,10 @@ private:
           r.push_back(1);
           r.push_back(a.code);
           r.push_back(a.value);
+        } else if (a.cls == Attr::Typed) {
+          r.push_back(a.cls);
+          r.push_back(a.code);
+          r.push_back(VE.typeID(a.type));
         } else {
           r.push_back(a.cls);
           for (unsigned char c : a.key) r.push_back(c);

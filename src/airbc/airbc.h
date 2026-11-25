@@ -39,17 +39,19 @@ struct Type {
 
 // ---------------------------------------------------------------- attributes
 struct Attr {
-  enum Cls : uint8_t { Enum = 0, Int = 1, Str = 3, StrVal = 4 };
+  enum Cls : uint8_t { Enum = 0, Int = 1, Str = 3, StrVal = 4, Typed = 6 };
   Cls cls = Enum;
   uint32_t code = 0; // bitcode ATTR_KIND_*
   int rank = 0;      // LLVM 13 Attribute::AttrKind order (enum/int); strings sort after
   uint64_t value = 0;
+  const Type *type = nullptr;
   std::string key, val;
   static Attr get(const char *name, uint64_t intValue = 0); // "nounwind", "readnone", "align" (with value) ...
+  static Attr typed(const char *name, const Type *type);
   static Attr str(std::string k, std::string v = "");
   bool operator<(const Attr &o) const;
   bool operator==(const Attr &o) const {
-    return cls == o.cls && code == o.code && value == o.value && key == o.key && val == o.val;
+    return cls == o.cls && code == o.code && value == o.value && type == o.type && key == o.key && val == o.val;
   }
 };
 using AttrSet = std::vector<Attr>; // canonical (sorted, unique)
@@ -241,6 +243,7 @@ enum : uint8_t {
 };
 // Linkage, bitcode encoding.
 enum : uint32_t { Link_External = 0, Link_Internal = 3, Link_Private = 9 };
+enum : uint32_t { Call_Fast = 8 };
 
 struct Instruction : Value {
   Op op;
@@ -439,6 +442,7 @@ public:
 
   // globals and bodies
   Function *addFunction(const std::string &name, Type *fty);
+  void appendFunctionArguments(Function *f, const std::vector<Type *> &types);
   // Global variable. Defaults are what Metal emits for threadgroup memory: internal unnamed_addr undef.
   GlobalVariable *addGlobal(const std::string &name, Type *valueType, unsigned addrSpace, Constant *init,
                             uint32_t align, uint32_t linkage = Link_Internal, uint32_t unnamedAddr = 1,
